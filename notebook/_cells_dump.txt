@@ -1,0 +1,35 @@
+CELL1:
+import pandas as pd
+CELL3:
+
+
+ Load full dataset
+df = pd.read_csv("../data/raw/twcs.csv")
+
+# Create sample
+df_sample = df.sample(100000, random_state=42)
+
+# Save sample
+df_sample.to_csv("../data/own_sample/sample.csv", index=False)
+
+print("Sample created ✅")
+CELL5:
+
+
+rag_df = pd.read_csv("../data/processed/rag_qa_pairs.csv")
+
+print(rag_df.shape)
+print(rag_df.columns.tolist())
+rag_df.head(10)
+CELL7:
+df.shape
+df.columns
+df.head()
+CELL9:
+df.info()
+CELL11:
+df.isnull().sum()
+CELL13:
+df["inbound"].value_counts()
+CELL15:
+df["author_id"].value_counts().head(10)

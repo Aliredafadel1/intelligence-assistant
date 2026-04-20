@@ -1,0 +1,17 @@
+[project]
+name = "decision-intelligence-assistant"
+version = "0.1.0"
+description = "RAG, ML, and LLM pipeline for customer support tickets (TWCS)."
+requires-python = ">=3.10"
+dependencies = [
+    "pandas>=2.0,<3",
+]
+
+[dependency-groups]
+dev = [
+    "jupyterlab>=4.0",
+    "ipykernel>=6.0",
+]
+
+[tool.uv]
+package = false
