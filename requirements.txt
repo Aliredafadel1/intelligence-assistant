@@ -4,3 +4,4 @@ scipy
 joblib
 numpy
 openai
+chromadb

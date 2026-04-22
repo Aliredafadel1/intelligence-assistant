@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 from typing import Any
 
+import chromadb
 import joblib
 import numpy as np
 import pandas as pd
@@ -79,6 +80,10 @@ def resolve_openai_api_key() -> str:
 
 def default_index_dir() -> Path:
     return default_processed_dir() / "rag_index"
+
+
+def default_chroma_dir() -> Path:
+    return default_processed_dir() / "chroma_db"
 
 
 def chunk_text(text: str, max_chars: int, overlap: int) -> list[str]:
@@ -250,15 +255,96 @@ def save_rag_index_openai(
     }
 
 
+def _to_chroma_scalar(value: Any) -> str | int | float | bool | None:
+    if value is None:
+        return None
+    if isinstance(value, (np.integer,)):
+        return int(value)
+    if isinstance(value, (np.floating,)):
+        if np.isnan(value):
+            return None
+        return float(value)
+    if isinstance(value, (np.bool_,)):
+        return bool(value)
+    if pd.isna(value):
+        return None
+    if isinstance(value, (str, int, float, bool)):
+        return value
+    return str(value)
+
+
+def _build_chroma_records(manifest: pd.DataFrame, embeddings: np.ndarray) -> tuple[list[str], list[str], list[dict[str, str | int | float | bool]]]:
+    ids: list[str] = []
+    documents: list[str] = []
+    metadatas: list[dict[str, str | int | float | bool]] = []
+
+    for idx, row in manifest.iterrows():
+        qid = _to_chroma_scalar(row.get("question_tweet_id"))
+        aid = _to_chroma_scalar(row.get("answer_tweet_id"))
+        chunk_idx = _to_chroma_scalar(row.get("chunk_index"))
+        record_id = f"{qid or 'q'}:{aid or 'a'}:{chunk_idx or 0}:{idx}"
+        ids.append(record_id)
+        documents.append(str(row.get("index_text", "")))
+
+        md: dict[str, str | int | float | bool] = {}
+        for col, value in row.items():
+            if col == "index_text":
+                continue
+            clean = _to_chroma_scalar(value)
+            if clean is not None:
+                md[col] = clean
+        metadatas.append(md)
+
+    if len(ids) != embeddings.shape[0]:
+        raise ValueError("Manifest row count does not match embedding count for Chroma upsert.")
+    return ids, documents, metadatas
+
+
+def upsert_chroma_index(
+    manifest: pd.DataFrame,
+    embeddings: np.ndarray,
+    *,
+    chroma_path: Path,
+    collection_name: str,
+    batch_size: int = 200,
+) -> dict[str, Any]:
+    chroma_path = chroma_path.resolve()
+    chroma_path.mkdir(parents=True, exist_ok=True)
+    client = chromadb.PersistentClient(path=str(chroma_path))
+    collection = client.get_or_create_collection(name=collection_name, metadata={"hnsw:space": "cosine"})
+
+    ids, documents, metadatas = _build_chroma_records(manifest, embeddings)
+    vectors = embeddings.tolist()
+
+    for i in range(0, len(ids), batch_size):
+        collection.upsert(
+            ids=ids[i : i + batch_size],
+            embeddings=vectors[i : i + batch_size],
+            documents=documents[i : i + batch_size],
+            metadatas=metadatas[i : i + batch_size],
+        )
+
+    return {
+        "chroma_path": str(chroma_path),
+        "chroma_collection": collection_name,
+        "n_rows": len(ids),
+        "n_features": int(embeddings.shape[1]),
+    }
+
+
 def build_rag_index_from_corpus(
     corpus: pd.DataFrame,
     out_dir: Path | None = None,
     *,
     backend: str = "tfidf",
+    storage: str = "local",
     openai_model: str = "text-embedding-3-small",
     max_chunk_chars: int = 0,
     chunk_overlap: int = 50,
     concat_query: bool = False,
+    chroma_path: Path | None = None,
+    chroma_collection: str = "rag_tickets",
+    chroma_batch_size: int = 200,
 ) -> dict[str, Any]:
     manifest = build_index_manifest(
         corpus,
@@ -276,13 +362,29 @@ def build_rag_index_from_corpus(
         return save_rag_index_tfidf(manifest, vectorizer, matrix, target_dir)
     if backend == "openai":
         embeddings = embed_texts_openai(texts, model=openai_model)
-        return save_rag_index_openai(manifest, embeddings, target_dir, model=openai_model)
+        if storage == "local":
+            return save_rag_index_openai(manifest, embeddings, target_dir, model=openai_model)
+        if storage == "chroma":
+            cpath = chroma_path if chroma_path is not None else default_chroma_dir()
+            result = upsert_chroma_index(
+                manifest,
+                embeddings,
+                chroma_path=cpath,
+                collection_name=chroma_collection,
+                batch_size=chroma_batch_size,
+            )
+            result["backend"] = "openai-chroma"
+            result["embedding_provider"] = "openai"
+            result["embedding_model"] = openai_model
+            return result
+        raise ValueError("storage must be either 'local' or 'chroma'")
     raise ValueError("backend must be either 'tfidf' or 'openai'")
 
 
 def parse_args() -> argparse.Namespace:
     root = PROJECT_ROOT
     default_model = os.environ.get("OPENAI_EMBED_MODEL", "text-embedding-3-small")
+    default_collection = os.environ.get("CHROMA_COLLECTION", "rag_tickets")
     parser = argparse.ArgumentParser(
         description="Build RAG index from retrieval_corpus.csv (tfidf or openai embeddings)."
     )
@@ -303,6 +405,12 @@ def parse_args() -> argparse.Namespace:
         choices=("tfidf", "openai"),
         default="tfidf",
         help="Index backend to build.",
+    )
+    parser.add_argument(
+        "--storage",
+        choices=("local", "chroma"),
+        default="local",
+        help="Storage target for openai backend (local files or Chroma DB).",
     )
     parser.add_argument(
         "--openai-model",
@@ -327,6 +435,24 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Prepend query_text to each chunk in index_text (query-aware indexing).",
     )
+    parser.add_argument(
+        "--chroma-path",
+        type=Path,
+        default=None,
+        help="Persistent Chroma DB directory (default: data/processed/chroma_db).",
+    )
+    parser.add_argument(
+        "--chroma-collection",
+        type=str,
+        default=default_collection,
+        help="Chroma collection name.",
+    )
+    parser.add_argument(
+        "--chroma-batch-size",
+        type=int,
+        default=200,
+        help="Batch size for Chroma upserts.",
+    )
     return parser.parse_args()
 
 
@@ -341,19 +467,31 @@ def main() -> None:
         corpus,
         args.out_dir.resolve() if args.out_dir is not None else None,
         backend=args.backend,
+        storage=args.storage,
         openai_model=args.openai_model,
         max_chunk_chars=args.max_chunk_chars,
         chunk_overlap=args.chunk_overlap,
         concat_query=args.concat_query,
+        chroma_path=args.chroma_path.resolve() if args.chroma_path is not None else None,
+        chroma_collection=args.chroma_collection,
+        chroma_batch_size=args.chroma_batch_size,
     )
     print(f"Backend         : {args.backend}")
+    print(f"Storage         : {args.storage}")
+    if args.backend == "openai":
+        print("Embed provider  : openai")
+        print(f"Embed model     : {args.openai_model}")
     print(f"Indexed rows    : {paths['n_rows']:,}")
     print(f"Feature columns : {paths['n_features']:,}")
     if args.backend == "tfidf":
         for k in ("manifest", "vectorizer", "matrix", "meta"):
             print(f"{k:14s} : {paths[k]}")
     else:
-        for k in ("manifest", "embeddings", "meta"):
-            print(f"{k:14s} : {paths[k]}")
+        if args.storage == "local":
+            for k in ("manifest", "embeddings", "meta"):
+                print(f"{k:14s} : {paths[k]}")
+        else:
+            for k in ("chroma_path", "chroma_collection"):
+                print(f"{k:14s} : {paths[k]}")
 if __name__ == "__main__":
     main()

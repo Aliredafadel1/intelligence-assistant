@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 from typing import Any
 
+import chromadb
 import joblib
 import numpy as np
 import pandas as pd
@@ -76,6 +77,16 @@ def resolve_openai_api_key() -> str:
     return key
 
 
+def embed_query(model: str, query: str) -> np.ndarray:
+    q = query.strip()
+    if not q:
+        raise ValueError("Query is empty.")
+    api_key = resolve_openai_api_key()
+    client = OpenAI(api_key=api_key)
+    resp = client.embeddings.create(model=model, input=[q])
+    return np.asarray(resp.data[0].embedding, dtype=np.float32)
+
+
 def _cosine_dense(query_vec: np.ndarray, matrix: np.ndarray) -> np.ndarray:
     q = query_vec.astype(np.float32)
     m = matrix.astype(np.float32)
@@ -86,6 +97,10 @@ def _cosine_dense(query_vec: np.ndarray, matrix: np.ndarray) -> np.ndarray:
     denom = q_norm * m_norm
     denom = np.where(denom == 0, 1e-12, denom)
     return (m @ q) / denom
+
+
+def default_chroma_dir() -> Path:
+    return default_index_dir().parent / "chroma_db"
 
 
 def load_rag_index(index_dir: Path) -> tuple[str, pd.DataFrame, dict[str, Any]]:
@@ -125,6 +140,48 @@ def load_rag_index(index_dir: Path) -> tuple[str, pd.DataFrame, dict[str, Any]]:
     raise ValueError(f"Unsupported backend in index metadata: {backend}")
 
 
+def retrieve_top_k_chroma(
+    query: str,
+    *,
+    k: int,
+    collection_name: str,
+    chroma_path: Path,
+    model: str,
+) -> pd.DataFrame:
+    q = query.strip()
+    if not q:
+        raise ValueError("Query is empty.")
+    q_vec = embed_query(model, q).tolist()
+
+    db = chromadb.PersistentClient(path=str(chroma_path.resolve()))
+    collection = db.get_collection(name=collection_name)
+    result = collection.query(
+        query_embeddings=[q_vec],
+        n_results=k,
+        include=["documents", "metadatas", "distances"],
+    )
+
+    ids = result.get("ids", [[]])[0]
+    docs = result.get("documents", [[]])[0]
+    metas = result.get("metadatas", [[]])[0]
+    dists = result.get("distances", [[]])[0]
+    rows: list[dict[str, Any]] = []
+    for i, row_id in enumerate(ids):
+        md = metas[i] if i < len(metas) and metas[i] is not None else {}
+        dist = float(dists[i]) if i < len(dists) and dists[i] is not None else 1.0
+        score = 1.0 - dist
+        row = {
+            "rank": i + 1,
+            "similarity_score": score,
+            "id": row_id,
+            "index_text": docs[i] if i < len(docs) else "",
+        }
+        if isinstance(md, dict):
+            row.update(md)
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
 def retrieve_top_k(
     query: str,
     backend: str,
@@ -144,14 +201,11 @@ def retrieve_top_k(
         query_vec = vectorizer.transform([q])
         sims = cosine_similarity(query_vec, matrix).ravel()
     elif backend == "openai":
-        api_key = resolve_openai_api_key()
         embeddings = payload["embeddings"]
         if embeddings.shape[0] == 0:
             raise ValueError("Embeddings matrix is empty.")
         model = payload["meta"].get("embedding_model", "text-embedding-3-small")
-        client = OpenAI(api_key=api_key)
-        resp = client.embeddings.create(model=model, input=[q])
-        q_vec = np.asarray(resp.data[0].embedding, dtype=np.float32)
+        q_vec = embed_query(model, q)
         sims = _cosine_dense(q_vec, embeddings)
     else:
         raise ValueError("backend must be either 'tfidf' or 'openai'")
@@ -187,6 +241,8 @@ def select_output_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def parse_args() -> argparse.Namespace:
+    default_collection = os.environ.get("CHROMA_COLLECTION", "rag_tickets")
+    default_openai_model = os.environ.get("OPENAI_EMBED_MODEL", "text-embedding-3-small")
     parser = argparse.ArgumentParser(
         description="Query RAG index (tfidf/openai backend) and return top-k similar entries."
     )
@@ -203,10 +259,34 @@ def parse_args() -> argparse.Namespace:
         help="Top-k results to return.",
     )
     parser.add_argument(
+        "--backend",
+        choices=("auto", "local", "chroma"),
+        default="auto",
+        help="Retrieval source: local index artifacts or Chroma DB.",
+    )
+    parser.add_argument(
         "--index-dir",
         type=Path,
         default=None,
         help="Index directory (default: data/processed/rag_index).",
+    )
+    parser.add_argument(
+        "--chroma-path",
+        type=Path,
+        default=None,
+        help="Persistent Chroma DB directory (default: data/processed/chroma_db).",
+    )
+    parser.add_argument(
+        "--chroma-collection",
+        type=str,
+        default=default_collection,
+        help="Chroma collection name.",
+    )
+    parser.add_argument(
+        "--openai-model",
+        type=str,
+        default=default_openai_model,
+        help="OpenAI embedding model used for query embedding.",
     )
     parser.add_argument(
         "--output",
@@ -224,10 +304,22 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    index_dir = args.index_dir.resolve() if args.index_dir is not None else default_index_dir()
-    backend, manifest, payload = load_rag_index(index_dir)
-    topk = retrieve_top_k(args.query, backend, manifest, payload, k=args.k)
-    topk = select_output_columns(topk)
+    if args.backend == "chroma":
+        chroma_path = args.chroma_path.resolve() if args.chroma_path is not None else default_chroma_dir()
+        topk = retrieve_top_k_chroma(
+            args.query,
+            k=args.k,
+            collection_name=args.chroma_collection,
+            chroma_path=chroma_path,
+            model=args.openai_model,
+        )
+        backend = "openai-chroma"
+        topk = select_output_columns(topk)
+    else:
+        index_dir = args.index_dir.resolve() if args.index_dir is not None else default_index_dir()
+        backend, manifest, payload = load_rag_index(index_dir)
+        topk = retrieve_top_k(args.query, backend, manifest, payload, k=args.k)
+        topk = select_output_columns(topk)
 
     if args.output is not None:
         out_path = args.output.resolve()
