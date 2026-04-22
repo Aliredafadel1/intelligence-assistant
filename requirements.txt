@@ -1,7 +1,9 @@
 pandas
 scikit-learn
+xgboost
 scipy
 joblib
 numpy
 openai
 chromadb
+sentence-transformers

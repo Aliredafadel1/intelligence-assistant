@@ -6,11 +6,11 @@ from pathlib import Path
 import pandas as pd
 
 try:
-    from .clean_data import clean_dataframe
-    from .load_data import load_twcs
+    from .data.clean_data import clean_dataframe
+    from .data.load_data import load_twcs
 except ImportError:
-    from clean_data import clean_dataframe
-    from load_data import load_twcs
+    from data.clean_data import clean_dataframe
+    from data.load_data import load_twcs
 
 
 def default_processed_dir() -> Path:

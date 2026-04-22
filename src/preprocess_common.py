@@ -5,9 +5,9 @@ from pathlib import Path
 import pandas as pd
 
 try:
-    from .clean_data import clean_dataframe
+    from .data.clean_data import clean_dataframe
 except ImportError:
-    from clean_data import clean_dataframe
+    from data.clean_data import clean_dataframe
 
 
 def project_root() -> Path:

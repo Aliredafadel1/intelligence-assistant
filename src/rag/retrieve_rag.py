@@ -2,25 +2,33 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 from pathlib import Path
 from typing import Any
+
+os.environ.setdefault("ANONYMIZED_TELEMETRY", "False")
+os.environ.setdefault("CHROMA_TELEMETRY_IMPL", "chromadb.telemetry.product.null.NullTelemetry")
+os.environ.setdefault("POSTHOG_DISABLED", "1")
 
 import chromadb
 import joblib
 import numpy as np
 import pandas as pd
-from openai import OpenAI
+from chromadb.config import Settings
 from scipy import sparse
+from sentence_transformers import SentenceTransformer
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
+
+logging.getLogger("chromadb.telemetry.product.posthog").disabled = True
 
 try:
     from .index_rag import default_index_dir
 except ImportError:
     from index_rag import default_index_dir
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 ENV_PATH = PROJECT_ROOT / ".env"
 
 
@@ -41,50 +49,18 @@ def load_env_file(env_path: Path) -> None:
 load_env_file(ENV_PATH)
 
 
-def read_env_file_value(env_path: Path, key: str) -> str | None:
-    if not env_path.exists():
-        return None
-    prefix = f"{key}="
-    for raw_line in env_path.read_text(encoding="utf-8").splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#") or not line.startswith(prefix):
-            continue
-        value = line.split("=", 1)[1].strip().strip('"').strip("'")
-        return value
-    return None
-
-
-def is_placeholder_key(value: str) -> bool:
-    return "YOUR_NEW_OPENAI_API_KEY" in value
-
-
-def resolve_openai_api_key() -> str:
-    env_key = (os.environ.get("OPENAI_API_KEY") or "").strip()
-    file_key = (read_env_file_value(ENV_PATH, "OPENAI_API_KEY") or "").strip()
-    if file_key and not is_placeholder_key(file_key):
-        key = file_key
-    else:
-        key = env_key
-
-    if not key:
-        raise EnvironmentError("OPENAI_API_KEY is missing. Set it in .env or environment.")
-    if is_placeholder_key(key):
-        raise EnvironmentError("OPENAI_API_KEY is placeholder text. Replace it with a real key.")
-    if not key.startswith("sk-") or len(key) < 40:
-        raise EnvironmentError(
-            "OPENAI_API_KEY format looks invalid. It should start with 'sk-' and be full length."
-        )
-    return key
-
-
 def embed_query(model: str, query: str) -> np.ndarray:
     q = query.strip()
     if not q:
         raise ValueError("Query is empty.")
-    api_key = resolve_openai_api_key()
-    client = OpenAI(api_key=api_key)
-    resp = client.embeddings.create(model=model, input=[q])
-    return np.asarray(resp.data[0].embedding, dtype=np.float32)
+    encoder = SentenceTransformer(model)
+    vec = encoder.encode(
+        [q],
+        convert_to_numpy=True,
+        normalize_embeddings=True,
+        show_progress_bar=False,
+    ).astype(np.float32)
+    return vec[0]
 
 
 def _cosine_dense(query_vec: np.ndarray, matrix: np.ndarray) -> np.ndarray:
@@ -127,15 +103,18 @@ def load_rag_index(index_dir: Path) -> tuple[str, pd.DataFrame, dict[str, Any]]:
         }
         return backend, manifest, payload
 
-    if backend == "openai":
-        embeddings_path = root / "openai_embeddings.npy"
+    if backend in {"openai", "sbert"}:
+        embeddings_path = root / "local_embeddings.npy"
+        if backend == "openai" and not embeddings_path.exists():
+            embeddings_path = root / "openai_embeddings.npy"
         if not embeddings_path.exists():
-            raise FileNotFoundError("OpenAI embeddings artifact missing for openai backend.")
+            raise FileNotFoundError("Dense embeddings artifact missing for sbert/openai backend.")
         payload = {
             "embeddings": np.load(embeddings_path),
             "meta": meta,
         }
-        return backend, manifest, payload
+        normalized_backend = "sbert" if backend == "openai" else backend
+        return normalized_backend, manifest, payload
 
     raise ValueError(f"Unsupported backend in index metadata: {backend}")
 
@@ -146,15 +125,25 @@ def retrieve_top_k_chroma(
     k: int,
     collection_name: str,
     chroma_path: Path,
-    model: str,
+    model: str | None,
 ) -> pd.DataFrame:
     q = query.strip()
     if not q:
         raise ValueError("Query is empty.")
-    q_vec = embed_query(model, q).tolist()
-
-    db = chromadb.PersistentClient(path=str(chroma_path.resolve()))
+    db = chromadb.PersistentClient(
+        path=str(chroma_path.resolve()),
+        settings=Settings(anonymized_telemetry=False),
+    )
     collection = db.get_collection(name=collection_name)
+    metadata = collection.metadata or {}
+    effective_model = model or metadata.get("embedding_model") or "sentence-transformers/all-MiniLM-L6-v2"
+    if model is not None and metadata.get("embedding_model") and model != metadata.get("embedding_model"):
+        print(
+            f"Warning: requested embed model '{model}' differs from collection model "
+            f"'{metadata.get('embedding_model')}'. Using collection model."
+        )
+        effective_model = metadata.get("embedding_model")
+    q_vec = embed_query(effective_model, q).tolist()
     result = collection.query(
         query_embeddings=[q_vec],
         n_results=k,
@@ -200,15 +189,15 @@ def retrieve_top_k(
             raise ValueError("Index matrix is empty.")
         query_vec = vectorizer.transform([q])
         sims = cosine_similarity(query_vec, matrix).ravel()
-    elif backend == "openai":
+    elif backend == "sbert":
         embeddings = payload["embeddings"]
         if embeddings.shape[0] == 0:
             raise ValueError("Embeddings matrix is empty.")
-        model = payload["meta"].get("embedding_model", "text-embedding-3-small")
+        model = payload["meta"].get("embedding_model", "sentence-transformers/all-MiniLM-L6-v2")
         q_vec = embed_query(model, q)
         sims = _cosine_dense(q_vec, embeddings)
     else:
-        raise ValueError("backend must be either 'tfidf' or 'openai'")
+        raise ValueError("backend must be either 'tfidf' or 'sbert'")
 
     if sims.size == 0:
         return manifest.head(0).copy()
@@ -242,9 +231,9 @@ def select_output_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 def parse_args() -> argparse.Namespace:
     default_collection = os.environ.get("CHROMA_COLLECTION", "rag_tickets")
-    default_openai_model = os.environ.get("OPENAI_EMBED_MODEL", "text-embedding-3-small")
+    default_embed_model = os.environ.get("EMBED_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
     parser = argparse.ArgumentParser(
-        description="Query RAG index (tfidf/openai backend) and return top-k similar entries."
+        description="Query RAG index (tfidf/sbert backend) and return top-k similar entries."
     )
     parser.add_argument(
         "--query",
@@ -283,10 +272,10 @@ def parse_args() -> argparse.Namespace:
         help="Chroma collection name.",
     )
     parser.add_argument(
-        "--openai-model",
+        "--embed-model",
         type=str,
-        default=default_openai_model,
-        help="OpenAI embedding model used for query embedding.",
+        default=None,
+        help="SentenceTransformer embedding model used for query embedding.",
     )
     parser.add_argument(
         "--output",
@@ -311,9 +300,9 @@ def main() -> None:
             k=args.k,
             collection_name=args.chroma_collection,
             chroma_path=chroma_path,
-            model=args.openai_model,
+            model=args.embed_model,
         )
-        backend = "openai-chroma"
+        backend = "sbert-chroma"
         topk = select_output_columns(topk)
     else:
         index_dir = args.index_dir.resolve() if args.index_dir is not None else default_index_dir()

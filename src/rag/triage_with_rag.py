@@ -7,8 +7,8 @@ from pathlib import Path
 import pandas as pd
 
 try:
-    from .llm_client import default_model as default_llm_model
-    from .llm_client import generate_text
+    from ..LLM.llm_client import default_model as default_llm_model
+    from ..LLM.llm_client import generate_text
     from .retrieve_rag import (
         default_chroma_dir,
         default_index_dir,
@@ -18,8 +18,8 @@ try:
         select_output_columns,
     )
 except ImportError:
-    from llm_client import default_model as default_llm_model
-    from llm_client import generate_text
+    from LLM.llm_client import default_model as default_llm_model
+    from LLM.llm_client import generate_text
     from retrieve_rag import (
         default_chroma_dir,
         default_index_dir,
@@ -53,12 +53,15 @@ def build_triage_prompt(ticket_text: str, results: pd.DataFrame) -> str:
         "You are a support triage assistant.\n"
         "Given a new ticket and retrieved historical context, provide:\n"
         "1) suggested priority (P1/P2/P3/P4),\n"
-        "2) confidence (0-1),\n"
+        "2) confidence (0-1) as triage decision confidence,\n"
         "3) short rationale,\n"
         "4) immediate next action.\n\n"
+        "Important: confidence is NOT the raw retrieval similarity score.\n"
+        "Use retrieval matches as evidence, then estimate confidence in the final priority decision.\n"
+        "Return confidence rounded to 2 decimals.\n\n"
         f"New ticket:\n{ticket_text.strip()}\n\n"
         f"Retrieved context:\n{context}\n\n"
-        "Output in compact JSON with keys: priority, confidence, rationale, next_action."
+        "Output ONLY compact JSON with keys: priority, confidence, rationale, next_action."
     )
 
 
@@ -69,6 +72,57 @@ def build_non_rag_prompt(ticket_text: str) -> str:
         "Keep it practical and action-oriented in 2-4 sentences.\n\n"
         f"Customer ticket:\n{ticket_text.strip()}"
     )
+
+
+def _extract_json_object(text: str) -> dict | None:
+    raw = (text or "").strip()
+    if not raw:
+        return None
+    # Handle fenced Markdown JSON responses.
+    if "```" in raw:
+        start = raw.find("{")
+        end = raw.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            raw = raw[start : end + 1]
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _normalize_priority(value: object) -> str:
+    val = str(value or "").strip().upper()
+    return val if val in {"P1", "P2", "P3", "P4"} else "P3"
+
+
+def _normalize_confidence(value: object) -> float:
+    try:
+        conf = float(value)
+    except (TypeError, ValueError):
+        conf = 0.5
+    conf = max(0.0, min(1.0, conf))
+    return round(conf, 2)
+
+
+def normalize_rag_answer(raw_answer: str) -> str:
+    parsed = _extract_json_object(raw_answer)
+    if parsed is None:
+        fallback = {
+            "priority": "P3",
+            "confidence": 0.5,
+            "rationale": "Model output was not valid JSON; using safe normalized fallback.",
+            "next_action": "Collect missing details and route ticket for manual review.",
+        }
+        return json.dumps(fallback)
+
+    normalized = {
+        "priority": _normalize_priority(parsed.get("priority")),
+        "confidence": _normalize_confidence(parsed.get("confidence")),
+        "rationale": str(parsed.get("rationale", "")).strip() or "No rationale provided.",
+        "next_action": str(parsed.get("next_action", "")).strip() or "No next action provided.",
+    }
+    return json.dumps(normalized)
 
 
 def top_answer_tweet_id(results: pd.DataFrame) -> int | None:
@@ -114,9 +168,9 @@ def parse_args() -> argparse.Namespace:
         help="Chroma collection name.",
     )
     parser.add_argument(
-        "--openai-embed-model",
+        "--embed-model",
         type=str,
-        default="text-embedding-3-small",
+        default="sentence-transformers/all-MiniLM-L6-v2",
         help="Embedding model for Chroma query path.",
     )
     parser.add_argument(
@@ -142,7 +196,7 @@ def run_retrieval(args: argparse.Namespace) -> pd.DataFrame:
             k=args.k,
             collection_name=args.chroma_collection,
             chroma_path=cpath,
-            model=args.openai_embed_model,
+            model=args.embed_model,
         )
         return select_output_columns(df)
 
@@ -165,6 +219,7 @@ def main() -> None:
         max_tokens=400,
         allow_fallback=not args.no_llm_fallback,
     )
+    rag_answer = normalize_rag_answer(rag_answer)
     non_rag_answer = generate_text(
         non_rag_prompt,
         model=args.llm_model,

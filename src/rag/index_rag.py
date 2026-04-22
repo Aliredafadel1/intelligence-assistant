@@ -2,24 +2,32 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 from pathlib import Path
 from typing import Any
+
+os.environ.setdefault("ANONYMIZED_TELEMETRY", "False")
+os.environ.setdefault("CHROMA_TELEMETRY_IMPL", "chromadb.telemetry.product.null.NullTelemetry")
+os.environ.setdefault("POSTHOG_DISABLED", "1")
 
 import chromadb
 import joblib
 import numpy as np
 import pandas as pd
-from openai import OpenAI
+from chromadb.config import Settings
 from scipy import sparse
+from sentence_transformers import SentenceTransformer
 from sklearn.feature_extraction.text import TfidfVectorizer
 
+logging.getLogger("chromadb.telemetry.product.posthog").disabled = True
+
 try:
-    from .prepare_datasets import default_processed_dir
+    from ..prepare_datasets import default_processed_dir
 except ImportError:
     from prepare_datasets import default_processed_dir
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 ENV_PATH = PROJECT_ROOT / ".env"
 
 
@@ -38,44 +46,6 @@ def load_env_file(env_path: Path) -> None:
 
 
 load_env_file(ENV_PATH)
-
-
-def read_env_file_value(env_path: Path, key: str) -> str | None:
-    if not env_path.exists():
-        return None
-    prefix = f"{key}="
-    for raw_line in env_path.read_text(encoding="utf-8").splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#") or not line.startswith(prefix):
-            continue
-        value = line.split("=", 1)[1].strip().strip('"').strip("'")
-        return value
-    return None
-
-
-def is_placeholder_key(value: str) -> bool:
-    return "YOUR_NEW_OPENAI_API_KEY" in value
-
-
-def resolve_openai_api_key() -> str:
-    env_key = (os.environ.get("OPENAI_API_KEY") or "").strip()
-    file_key = (read_env_file_value(ENV_PATH, "OPENAI_API_KEY") or "").strip()
-
-    # Prefer .env if it has a non-placeholder key; otherwise fallback to process env.
-    if file_key and not is_placeholder_key(file_key):
-        key = file_key
-    else:
-        key = env_key
-
-    if not key:
-        raise EnvironmentError("OPENAI_API_KEY is missing. Set it in .env or environment.")
-    if is_placeholder_key(key):
-        raise EnvironmentError("OPENAI_API_KEY is placeholder text. Replace it with a real key.")
-    if not key.startswith("sk-") or len(key) < 40:
-        raise EnvironmentError(
-            "OPENAI_API_KEY format looks invalid. It should start with 'sk-' and be full length."
-        )
-    return key
 
 
 def default_index_dir() -> Path:
@@ -160,24 +130,22 @@ def fit_tfidf_index(texts: list[str]) -> tuple[TfidfVectorizer, sparse.csr_matri
     return vectorizer, matrix
 
 
-def embed_texts_openai(
+def embed_texts_sbert(
     texts: list[str],
     *,
     model: str,
-    batch_size: int = 128,
+    batch_size: int = 64,
 ) -> np.ndarray:
-    api_key = resolve_openai_api_key()
-
-    client = OpenAI(api_key=api_key)
-    vectors: list[list[float]] = []
-    for i in range(0, len(texts), batch_size):
-        batch = texts[i : i + batch_size]
-        resp = client.embeddings.create(model=model, input=batch)
-        vectors.extend([d.embedding for d in resp.data])
-
-    arr = np.asarray(vectors, dtype=np.float32)
+    encoder = SentenceTransformer(model)
+    arr = encoder.encode(
+        texts,
+        batch_size=batch_size,
+        convert_to_numpy=True,
+        normalize_embeddings=True,
+        show_progress_bar=False,
+    ).astype(np.float32)
     if arr.ndim != 2:
-        raise ValueError("OpenAI embeddings returned unexpected shape.")
+        raise ValueError("SentenceTransformer embeddings returned unexpected shape.")
     return arr
 
 
@@ -219,7 +187,7 @@ def save_rag_index_tfidf(
     }
 
 
-def save_rag_index_openai(
+def save_rag_index_embeddings(
     manifest: pd.DataFrame,
     embeddings: np.ndarray,
     out_dir: Path,
@@ -230,15 +198,16 @@ def save_rag_index_openai(
     out_dir.mkdir(parents=True, exist_ok=True)
 
     manifest_path = out_dir / "manifest.csv"
-    embeddings_path = out_dir / "openai_embeddings.npy"
+    embeddings_path = out_dir / "local_embeddings.npy"
     meta_path = out_dir / "index_meta.json"
 
     manifest.to_csv(manifest_path, index=False)
     np.save(embeddings_path, embeddings)
 
     meta = {
-        "backend": "openai",
+        "backend": "sbert",
         "embedding_model": model,
+        "embedding_provider": "sentence-transformers",
         "n_rows": int(embeddings.shape[0]),
         "n_features": int(embeddings.shape[1]),
         "index_text_column": "index_text",
@@ -306,14 +275,31 @@ def upsert_chroma_index(
     *,
     chroma_path: Path,
     collection_name: str,
+    embedding_model: str,
+    embedding_provider: str = "sentence-transformers",
     batch_size: int = 200,
 ) -> dict[str, Any]:
     chroma_path = chroma_path.resolve()
     chroma_path.mkdir(parents=True, exist_ok=True)
-    client = chromadb.PersistentClient(path=str(chroma_path))
-    collection = client.get_or_create_collection(name=collection_name, metadata={"hnsw:space": "cosine"})
+    client = chromadb.PersistentClient(
+        path=str(chroma_path),
+        settings=Settings(anonymized_telemetry=False),
+    )
+    collection = client.get_or_create_collection(
+        name=collection_name,
+        metadata={
+            "hnsw:space": "cosine",
+            "embedding_provider": embedding_provider,
+            "embedding_model": embedding_model,
+        },
+    )
 
     ids, documents, metadatas = _build_chroma_records(manifest, embeddings)
+    if not ids:
+        raise ValueError("No IDs prepared for Chroma upsert.")
+    empty_docs = sum(1 for d in documents if not str(d).strip())
+    if empty_docs > 0:
+        raise ValueError(f"Found {empty_docs} empty documents; aborting Chroma upsert.")
     vectors = embeddings.tolist()
 
     for i in range(0, len(ids), batch_size):
@@ -324,9 +310,22 @@ def upsert_chroma_index(
             metadatas=metadatas[i : i + batch_size],
         )
 
+    # Debug checks: verify persistence and basic retrieval immediately after ingestion.
+    count = collection.count()
+    print(f"Chroma count    : {count}")
+    print(f"DB path exists  : {chroma_path.exists()}")
+    sample_results = collection.query(
+        query_embeddings=[vectors[0]],
+        n_results=min(3, max(1, count)),
+        include=["documents", "distances"],
+    )
+    print(f"Retrieved docs  : {sample_results.get('documents')}")
+
     return {
         "chroma_path": str(chroma_path),
         "chroma_collection": collection_name,
+        "embedding_provider": embedding_provider,
+        "embedding_model": embedding_model,
         "n_rows": len(ids),
         "n_features": int(embeddings.shape[1]),
     }
@@ -336,9 +335,9 @@ def build_rag_index_from_corpus(
     corpus: pd.DataFrame,
     out_dir: Path | None = None,
     *,
-    backend: str = "tfidf",
+    backend: str = "sbert",
     storage: str = "local",
-    openai_model: str = "text-embedding-3-small",
+    embed_model: str = "sentence-transformers/all-MiniLM-L6-v2",
     max_chunk_chars: int = 0,
     chunk_overlap: int = 50,
     concat_query: bool = False,
@@ -360,10 +359,10 @@ def build_rag_index_from_corpus(
     if backend == "tfidf":
         vectorizer, matrix = fit_tfidf_index(texts)
         return save_rag_index_tfidf(manifest, vectorizer, matrix, target_dir)
-    if backend == "openai":
-        embeddings = embed_texts_openai(texts, model=openai_model)
+    if backend == "sbert":
+        embeddings = embed_texts_sbert(texts, model=embed_model)
         if storage == "local":
-            return save_rag_index_openai(manifest, embeddings, target_dir, model=openai_model)
+            return save_rag_index_embeddings(manifest, embeddings, target_dir, model=embed_model)
         if storage == "chroma":
             cpath = chroma_path if chroma_path is not None else default_chroma_dir()
             result = upsert_chroma_index(
@@ -371,22 +370,24 @@ def build_rag_index_from_corpus(
                 embeddings,
                 chroma_path=cpath,
                 collection_name=chroma_collection,
+                embedding_model=embed_model,
+                embedding_provider="sentence-transformers",
                 batch_size=chroma_batch_size,
             )
-            result["backend"] = "openai-chroma"
-            result["embedding_provider"] = "openai"
-            result["embedding_model"] = openai_model
+            result["backend"] = "sbert-chroma"
+            result["embedding_provider"] = "sentence-transformers"
+            result["embedding_model"] = embed_model
             return result
         raise ValueError("storage must be either 'local' or 'chroma'")
-    raise ValueError("backend must be either 'tfidf' or 'openai'")
+    raise ValueError("backend must be either 'tfidf' or 'sbert'")
 
 
 def parse_args() -> argparse.Namespace:
     root = PROJECT_ROOT
-    default_model = os.environ.get("OPENAI_EMBED_MODEL", "text-embedding-3-small")
+    default_model = os.environ.get("EMBED_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
     default_collection = os.environ.get("CHROMA_COLLECTION", "rag_tickets")
     parser = argparse.ArgumentParser(
-        description="Build RAG index from retrieval_corpus.csv (tfidf or openai embeddings)."
+        description="Build RAG index from retrieval_corpus.csv (tfidf or sentence-transformer embeddings)."
     )
     parser.add_argument(
         "--input",
@@ -402,21 +403,21 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--backend",
-        choices=("tfidf", "openai"),
-        default="tfidf",
+        choices=("tfidf", "sbert"),
+        default="sbert",
         help="Index backend to build.",
     )
     parser.add_argument(
         "--storage",
         choices=("local", "chroma"),
         default="local",
-        help="Storage target for openai backend (local files or Chroma DB).",
+        help="Storage target for dense embedding backend (local files or Chroma DB).",
     )
     parser.add_argument(
-        "--openai-model",
+        "--embed-model",
         type=str,
         default=default_model,
-        help="OpenAI embedding model when backend=openai.",
+        help="SentenceTransformer model when backend=sbert.",
     )
     parser.add_argument(
         "--max-chunk-chars",
@@ -468,7 +469,7 @@ def main() -> None:
         args.out_dir.resolve() if args.out_dir is not None else None,
         backend=args.backend,
         storage=args.storage,
-        openai_model=args.openai_model,
+        embed_model=args.embed_model,
         max_chunk_chars=args.max_chunk_chars,
         chunk_overlap=args.chunk_overlap,
         concat_query=args.concat_query,
@@ -478,9 +479,9 @@ def main() -> None:
     )
     print(f"Backend         : {args.backend}")
     print(f"Storage         : {args.storage}")
-    if args.backend == "openai":
-        print("Embed provider  : openai")
-        print(f"Embed model     : {args.openai_model}")
+    if args.backend == "sbert":
+        print("Embed provider  : sentence-transformers")
+        print(f"Embed model     : {args.embed_model}")
     print(f"Indexed rows    : {paths['n_rows']:,}")
     print(f"Feature columns : {paths['n_features']:,}")
     if args.backend == "tfidf":
