@@ -2,10 +2,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
+from typing import Any
 
 import joblib
+import numpy as np
 import pandas as pd
+from openai import OpenAI
 from scipy import sparse
 from sklearn.feature_extraction.text import TfidfVectorizer
 
@@ -13,6 +17,64 @@ try:
     from .prepare_datasets import default_processed_dir
 except ImportError:
     from prepare_datasets import default_processed_dir
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+ENV_PATH = PROJECT_ROOT / ".env"
+
+
+def load_env_file(env_path: Path) -> None:
+    if not env_path.exists():
+        return
+    for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+load_env_file(ENV_PATH)
+
+
+def read_env_file_value(env_path: Path, key: str) -> str | None:
+    if not env_path.exists():
+        return None
+    prefix = f"{key}="
+    for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or not line.startswith(prefix):
+            continue
+        value = line.split("=", 1)[1].strip().strip('"').strip("'")
+        return value
+    return None
+
+
+def is_placeholder_key(value: str) -> bool:
+    return "YOUR_NEW_OPENAI_API_KEY" in value
+
+
+def resolve_openai_api_key() -> str:
+    env_key = (os.environ.get("OPENAI_API_KEY") or "").strip()
+    file_key = (read_env_file_value(ENV_PATH, "OPENAI_API_KEY") or "").strip()
+
+    # Prefer .env if it has a non-placeholder key; otherwise fallback to process env.
+    if file_key and not is_placeholder_key(file_key):
+        key = file_key
+    else:
+        key = env_key
+
+    if not key:
+        raise EnvironmentError("OPENAI_API_KEY is missing. Set it in .env or environment.")
+    if is_placeholder_key(key):
+        raise EnvironmentError("OPENAI_API_KEY is placeholder text. Replace it with a real key.")
+    if not key.startswith("sk-") or len(key) < 40:
+        raise EnvironmentError(
+            "OPENAI_API_KEY format looks invalid. It should start with 'sk-' and be full length."
+        )
+    return key
 
 
 def default_index_dir() -> Path:
@@ -93,12 +155,33 @@ def fit_tfidf_index(texts: list[str]) -> tuple[TfidfVectorizer, sparse.csr_matri
     return vectorizer, matrix
 
 
-def save_rag_index(
+def embed_texts_openai(
+    texts: list[str],
+    *,
+    model: str,
+    batch_size: int = 128,
+) -> np.ndarray:
+    api_key = resolve_openai_api_key()
+
+    client = OpenAI(api_key=api_key)
+    vectors: list[list[float]] = []
+    for i in range(0, len(texts), batch_size):
+        batch = texts[i : i + batch_size]
+        resp = client.embeddings.create(model=model, input=batch)
+        vectors.extend([d.embedding for d in resp.data])
+
+    arr = np.asarray(vectors, dtype=np.float32)
+    if arr.ndim != 2:
+        raise ValueError("OpenAI embeddings returned unexpected shape.")
+    return arr
+
+
+def save_rag_index_tfidf(
     manifest: pd.DataFrame,
     vectorizer: TfidfVectorizer,
     matrix: sparse.csr_matrix,
     out_dir: Path,
-) -> dict[str, str]:
+) -> dict[str, Any]:
     out_dir = out_dir.resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -131,14 +214,52 @@ def save_rag_index(
     }
 
 
+def save_rag_index_openai(
+    manifest: pd.DataFrame,
+    embeddings: np.ndarray,
+    out_dir: Path,
+    *,
+    model: str,
+) -> dict[str, Any]:
+    out_dir = out_dir.resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    manifest_path = out_dir / "manifest.csv"
+    embeddings_path = out_dir / "openai_embeddings.npy"
+    meta_path = out_dir / "index_meta.json"
+
+    manifest.to_csv(manifest_path, index=False)
+    np.save(embeddings_path, embeddings)
+
+    meta = {
+        "backend": "openai",
+        "embedding_model": model,
+        "n_rows": int(embeddings.shape[0]),
+        "n_features": int(embeddings.shape[1]),
+        "index_text_column": "index_text",
+        "manifest_csv": str(manifest_path.as_posix()),
+        "embeddings_path": str(embeddings_path.as_posix()),
+    }
+    meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    return {
+        "manifest": str(manifest_path),
+        "embeddings": str(embeddings_path),
+        "meta": str(meta_path),
+        "n_rows": meta["n_rows"],
+        "n_features": meta["n_features"],
+    }
+
+
 def build_rag_index_from_corpus(
     corpus: pd.DataFrame,
     out_dir: Path | None = None,
     *,
+    backend: str = "tfidf",
+    openai_model: str = "text-embedding-3-small",
     max_chunk_chars: int = 0,
     chunk_overlap: int = 50,
     concat_query: bool = False,
-) -> dict[str, str]:
+) -> dict[str, Any]:
     manifest = build_index_manifest(
         corpus,
         max_chunk_chars=max_chunk_chars,
@@ -149,15 +270,21 @@ def build_rag_index_from_corpus(
         raise ValueError("No rows to index: corpus is empty after filtering.")
 
     texts = manifest["index_text"].astype("string").fillna("").tolist()
-    vectorizer, matrix = fit_tfidf_index(texts)
     target_dir = out_dir if out_dir is not None else default_index_dir()
-    return save_rag_index(manifest, vectorizer, matrix, target_dir)
+    if backend == "tfidf":
+        vectorizer, matrix = fit_tfidf_index(texts)
+        return save_rag_index_tfidf(manifest, vectorizer, matrix, target_dir)
+    if backend == "openai":
+        embeddings = embed_texts_openai(texts, model=openai_model)
+        return save_rag_index_openai(manifest, embeddings, target_dir, model=openai_model)
+    raise ValueError("backend must be either 'tfidf' or 'openai'")
 
 
 def parse_args() -> argparse.Namespace:
-    root = Path(__file__).resolve().parents[1]
+    root = PROJECT_ROOT
+    default_model = os.environ.get("OPENAI_EMBED_MODEL", "text-embedding-3-small")
     parser = argparse.ArgumentParser(
-        description="Build TF-IDF vector index from retrieval_corpus.csv (RAG indexing)."
+        description="Build RAG index from retrieval_corpus.csv (tfidf or openai embeddings)."
     )
     parser.add_argument(
         "--input",
@@ -170,6 +297,18 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=None,
         help="Index output directory (default: data/processed/rag_index).",
+    )
+    parser.add_argument(
+        "--backend",
+        choices=("tfidf", "openai"),
+        default="tfidf",
+        help="Index backend to build.",
+    )
+    parser.add_argument(
+        "--openai-model",
+        type=str,
+        default=default_model,
+        help="OpenAI embedding model when backend=openai.",
     )
     parser.add_argument(
         "--max-chunk-chars",
@@ -201,15 +340,20 @@ def main() -> None:
     paths = build_rag_index_from_corpus(
         corpus,
         args.out_dir.resolve() if args.out_dir is not None else None,
+        backend=args.backend,
+        openai_model=args.openai_model,
         max_chunk_chars=args.max_chunk_chars,
         chunk_overlap=args.chunk_overlap,
         concat_query=args.concat_query,
     )
+    print(f"Backend         : {args.backend}")
     print(f"Indexed rows    : {paths['n_rows']:,}")
     print(f"Feature columns : {paths['n_features']:,}")
-    for k in ("manifest", "vectorizer", "matrix", "meta"):
-        print(f"{k:14s} : {paths[k]}")
-
-
+    if args.backend == "tfidf":
+        for k in ("manifest", "vectorizer", "matrix", "meta"):
+            print(f"{k:14s} : {paths[k]}")
+    else:
+        for k in ("manifest", "embeddings", "meta"):
+            print(f"{k:14s} : {paths[k]}")
 if __name__ == "__main__":
     main()

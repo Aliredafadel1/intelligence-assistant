@@ -2,3 +2,5 @@ pandas
 scikit-learn
 scipy
 joblib
+numpy
+openai
