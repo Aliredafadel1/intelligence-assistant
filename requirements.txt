@@ -1,1 +1,6 @@
--r requirements/serve.txt
+fastapi
+uvicorn
+openai
+chromadb==0.5.20
+numpy
+pandas
