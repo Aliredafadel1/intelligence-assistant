@@ -10,41 +10,26 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .schemas import CompareRequest
-
-try:
-    from ..LLM.llm_client import default_model as default_llm_model
-    from ..LLM.llm_client import generate_text
-    from ..observability.run_logger import RunLogger, utc_now_iso
-    from ..rag.triage_with_rag import (
-        build_non_rag_prompt,
-        build_triage_prompt,
-        normalize_rag_answer,
-        run_retrieval,
-        top_answer_tweet_id,
-    )
-except ImportError:
-    from LLM.llm_client import default_model as default_llm_model
-    from observability.run_logger import RunLogger, utc_now_iso
-    from rag.triage_with_rag import (
-        build_non_rag_prompt,
-        build_triage_prompt,
-        normalize_rag_answer,
-        run_retrieval,
-        top_answer_tweet_id,
-    )
+from ..LLM.llm_client import default_model as default_llm_model
+from ..LLM.llm_client import generate_text
+from ..observability.run_logger import RunLogger, utc_now_iso
+from ..rag.triage_with_rag import (
+    build_non_rag_prompt,
+    build_triage_prompt,
+    normalize_rag_answer,
+    run_retrieval,
+    top_answer_tweet_id,
+)
 
 
 def _load_ml_predictors() -> tuple[Callable[..., Any], Callable[..., Any]]:
     try:
         from ..ML.predict_compare import run_ml_prediction, run_zero_shot_prediction
-    except ImportError:
-        try:
-            from ML.predict_compare import run_ml_prediction, run_zero_shot_prediction
-        except ImportError as exc:
-            raise RuntimeError(
-                "ML endpoints are unavailable in serve mode. "
-                "Install training dependencies or run local training mode."
-            ) from exc
+    except ImportError as exc:
+        raise RuntimeError(
+            "ML endpoints are unavailable in serve mode. "
+            "Install training dependencies or run local training mode."
+        ) from exc
     return run_ml_prediction, run_zero_shot_prediction
 
 
