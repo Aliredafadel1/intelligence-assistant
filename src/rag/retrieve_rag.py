@@ -12,21 +12,12 @@ os.environ.setdefault("CHROMA_TELEMETRY_IMPL", "chromadb.telemetry.product.null.
 os.environ.setdefault("POSTHOG_DISABLED", "1")
 
 import chromadb
-import joblib
 import numpy as np
 import pandas as pd
 from chromadb.config import Settings
-from scipy import sparse
-from sentence_transformers import SentenceTransformer
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
+from openai import OpenAI
 
 logging.getLogger("chromadb.telemetry.product.posthog").disabled = True
-
-try:
-    from .index_rag import default_index_dir
-except ImportError:
-    from index_rag import default_index_dir
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 ENV_PATH = PROJECT_ROOT / ".env"
@@ -49,18 +40,28 @@ def load_env_file(env_path: Path) -> None:
 load_env_file(ENV_PATH)
 
 
+def default_index_dir() -> Path:
+    return PROJECT_ROOT / "data" / "processed" / "rag_index"
+
+
+def _get_openai_client() -> OpenAI:
+    api_key = (os.environ.get("OPENAI_API_KEY") or "").strip()
+    if not api_key:
+        raise ValueError("OPENAI_API_KEY is required for OpenAI embeddings.")
+    return OpenAI(api_key=api_key)
+
+
 def embed_query(model: str, query: str) -> np.ndarray:
     q = query.strip()
     if not q:
         raise ValueError("Query is empty.")
-    encoder = SentenceTransformer(model)
-    vec = encoder.encode(
-        [q],
-        convert_to_numpy=True,
-        normalize_embeddings=True,
-        show_progress_bar=False,
-    ).astype(np.float32)
-    return vec[0]
+    client = _get_openai_client()
+    response = client.embeddings.create(model=model, input=[q])
+    vec = np.array(response.data[0].embedding, dtype=np.float32)
+    norm = np.linalg.norm(vec)
+    if norm == 0:
+        return vec
+    return vec / norm
 
 
 def _cosine_dense(query_vec: np.ndarray, matrix: np.ndarray) -> np.ndarray:
@@ -111,6 +112,14 @@ def load_rag_index(index_dir: Path) -> tuple[str, pd.DataFrame, dict[str, Any]]:
     manifest = pd.read_csv(manifest_path)
     backend = meta.get("backend", "tfidf")
     if backend == "tfidf":
+        try:
+            import joblib
+            from scipy import sparse
+        except ImportError as exc:
+            raise ImportError(
+                "TF-IDF retrieval dependencies are missing in serve mode. "
+                "Install training dependencies or use backend=chroma."
+            ) from exc
         vectorizer_path = root / "tfidf_vectorizer.joblib"
         matrix_path = root / "tfidf_matrix.npz"
         if not vectorizer_path.exists() or not matrix_path.exists():
@@ -127,12 +136,12 @@ def load_rag_index(index_dir: Path) -> tuple[str, pd.DataFrame, dict[str, Any]]:
         if backend == "openai" and not embeddings_path.exists():
             embeddings_path = root / "openai_embeddings.npy"
         if not embeddings_path.exists():
-            raise FileNotFoundError("Dense embeddings artifact missing for sbert/openai backend.")
+            raise FileNotFoundError("Dense embeddings artifact missing for openai backend.")
         payload = {
             "embeddings": np.load(embeddings_path),
             "meta": meta,
         }
-        normalized_backend = "sbert" if backend == "openai" else backend
+        normalized_backend = "openai"
         return normalized_backend, manifest, payload
 
     raise ValueError(f"Unsupported backend in index metadata: {backend}")
@@ -152,7 +161,7 @@ def retrieve_top_k_chroma(
     db = _build_chroma_client(chroma_path)
     collection = db.get_collection(name=collection_name)
     metadata = collection.metadata or {}
-    effective_model = model or metadata.get("embedding_model") or "sentence-transformers/all-MiniLM-L6-v2"
+    effective_model = model or metadata.get("embedding_model") or "text-embedding-3-small"
     if model is not None and metadata.get("embedding_model") and model != metadata.get("embedding_model"):
         print(
             f"Warning: requested embed model '{model}' differs from collection model "
@@ -199,21 +208,28 @@ def retrieve_top_k(
     if not q:
         raise ValueError("Query is empty.")
     if backend == "tfidf":
+        try:
+            from sklearn.metrics.pairwise import cosine_similarity
+        except ImportError as exc:
+            raise ImportError(
+                "TF-IDF retrieval dependencies are missing in serve mode. "
+                "Install training dependencies or use backend=chroma."
+            ) from exc
         vectorizer = payload["vectorizer"]
         matrix = payload["matrix"]
         if matrix.shape[0] == 0:
             raise ValueError("Index matrix is empty.")
         query_vec = vectorizer.transform([q])
         sims = cosine_similarity(query_vec, matrix).ravel()
-    elif backend == "sbert":
+    elif backend == "openai":
         embeddings = payload["embeddings"]
         if embeddings.shape[0] == 0:
             raise ValueError("Embeddings matrix is empty.")
-        model = payload["meta"].get("embedding_model", "sentence-transformers/all-MiniLM-L6-v2")
+        model = payload["meta"].get("embedding_model", "text-embedding-3-small")
         q_vec = embed_query(model, q)
         sims = _cosine_dense(q_vec, embeddings)
     else:
-        raise ValueError("backend must be either 'tfidf' or 'sbert'")
+        raise ValueError("backend must be either 'tfidf' or 'openai'")
 
     if sims.size == 0:
         return manifest.head(0).copy()
@@ -247,9 +263,9 @@ def select_output_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 def parse_args() -> argparse.Namespace:
     default_collection = os.environ.get("CHROMA_COLLECTION", "rag_tickets")
-    default_embed_model = os.environ.get("EMBED_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
+    default_embed_model = os.environ.get("EMBED_MODEL", "text-embedding-3-small")
     parser = argparse.ArgumentParser(
-        description="Query RAG index (tfidf/sbert backend) and return top-k similar entries."
+        description="Query RAG index (tfidf/openai backend) and return top-k similar entries."
     )
     parser.add_argument(
         "--query",
@@ -291,7 +307,7 @@ def parse_args() -> argparse.Namespace:
         "--embed-model",
         type=str,
         default=None,
-        help="SentenceTransformer embedding model used for query embedding.",
+        help="OpenAI embedding model used for query embedding.",
     )
     parser.add_argument(
         "--output",
@@ -318,7 +334,7 @@ def main() -> None:
             chroma_path=chroma_path,
             model=args.embed_model,
         )
-        backend = "sbert-chroma"
+        backend = "openai-chroma"
         topk = select_output_columns(topk)
     else:
         index_dir = args.index_dir.resolve() if args.index_dir is not None else default_index_dir()

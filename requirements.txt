@@ -1,11 +1,1 @@
-pandas
-scikit-learn
-xgboost
-scipy
-joblib
-numpy
-fastapi
-uvicorn
-openai
-chromadb
-sentence-transformers
+-r requirements/train.txt

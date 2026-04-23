@@ -1,6 +1,7 @@
 services:
   chroma:
     image: chromadb/chroma:0.5.20
+    platform: linux/amd64
     container_name: ai_chroma
     ports:
       - "8001:8000"
@@ -12,12 +13,14 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.backend
+    platform: linux/amd64
     container_name: ai_backend
     env_file:
       - .env
     environment:
       - CHROMA_HOST=chroma
       - CHROMA_PORT=8000
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
     ports:
       - "8000:8000"
     depends_on:
@@ -31,6 +34,7 @@ services:
     build:
       context: ./frontend
       dockerfile: Dockerfile
+    platform: linux/amd64
     container_name: ai_frontend
     ports:
       - "5173:80"

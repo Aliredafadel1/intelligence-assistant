@@ -12,7 +12,7 @@ class CompareRequest(BaseModel):
     index_dir: str | None = None
     chroma_path: str | None = None
     chroma_collection: str = "rag_tickets"
-    embed_model: str = "sentence-transformers/all-MiniLM-L6-v2"
+    embed_model: str = "text-embedding-3-small"
     model_path: str = "data/artifacts/priority_baseline.joblib"
     author_id: str = "unknown_customer"
     outbound: bool = False

@@ -11,7 +11,7 @@ router = APIRouter(tags=["rag"])
 def ask_rag(
     q: str = Query(..., min_length=1, description="Question / ticket text."),
     k: int = Query(5, ge=1, le=20),
-    backend: str = Query("local", pattern="^(local|chroma)$"),
+    backend: str = Query("chroma", pattern="^(local|chroma)$"),
 ) -> dict:
     try:
         return run_rag_ask(question=q, k=k, retrieval_backend=backend)

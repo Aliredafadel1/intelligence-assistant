@@ -12,13 +12,10 @@ os.environ.setdefault("CHROMA_TELEMETRY_IMPL", "chromadb.telemetry.product.null.
 os.environ.setdefault("POSTHOG_DISABLED", "1")
 
 import chromadb
-import joblib
 import numpy as np
 import pandas as pd
 from chromadb.config import Settings
-from scipy import sparse
-from sentence_transformers import SentenceTransformer
-from sklearn.feature_extraction.text import TfidfVectorizer
+from openai import OpenAI
 
 logging.getLogger("chromadb.telemetry.product.posthog").disabled = True
 
@@ -137,7 +134,13 @@ def build_index_manifest(
     return pd.DataFrame(rows).reset_index(drop=True)
 
 
-def fit_tfidf_index(texts: list[str]) -> tuple[TfidfVectorizer, sparse.csr_matrix]:
+def fit_tfidf_index(texts: list[str]) -> tuple[object, object]:
+    try:
+        from sklearn.feature_extraction.text import TfidfVectorizer
+    except ImportError as exc:
+        raise ImportError(
+            "TF-IDF dependencies are missing. Install training dependencies for tfidf backend."
+        ) from exc
     vectorizer = TfidfVectorizer(
         max_features=50_000,
         ngram_range=(1, 2),
@@ -149,31 +152,53 @@ def fit_tfidf_index(texts: list[str]) -> tuple[TfidfVectorizer, sparse.csr_matri
     return vectorizer, matrix
 
 
-def embed_texts_sbert(
+def _get_openai_client() -> OpenAI:
+    api_key = (os.environ.get("OPENAI_API_KEY") or "").strip()
+    if not api_key:
+        raise ValueError("OPENAI_API_KEY is required for OpenAI embeddings.")
+    return OpenAI(api_key=api_key)
+
+
+def _normalize_embeddings(arr: np.ndarray) -> np.ndarray:
+    arr = arr.astype(np.float32, copy=False)
+    norms = np.linalg.norm(arr, axis=1, keepdims=True)
+    norms = np.where(norms == 0, 1e-12, norms)
+    return arr / norms
+
+
+def embed_texts_openai(
     texts: list[str],
     *,
     model: str,
-    batch_size: int = 64,
+    batch_size: int = 128,
 ) -> np.ndarray:
-    encoder = SentenceTransformer(model)
-    arr = encoder.encode(
-        texts,
-        batch_size=batch_size,
-        convert_to_numpy=True,
-        normalize_embeddings=True,
-        show_progress_bar=False,
-    ).astype(np.float32)
+    if not texts:
+        raise ValueError("No texts provided for embedding.")
+    client = _get_openai_client()
+    all_vectors: list[list[float]] = []
+    for i in range(0, len(texts), batch_size):
+        chunk = texts[i : i + batch_size]
+        response = client.embeddings.create(model=model, input=chunk)
+        all_vectors.extend(item.embedding for item in response.data)
+    arr = _normalize_embeddings(np.array(all_vectors, dtype=np.float32))
     if arr.ndim != 2:
-        raise ValueError("SentenceTransformer embeddings returned unexpected shape.")
+        raise ValueError("OpenAI embeddings returned unexpected shape.")
     return arr
 
 
 def save_rag_index_tfidf(
     manifest: pd.DataFrame,
-    vectorizer: TfidfVectorizer,
-    matrix: sparse.csr_matrix,
+    vectorizer: object,
+    matrix: object,
     out_dir: Path,
 ) -> dict[str, Any]:
+    try:
+        import joblib
+        from scipy import sparse
+    except ImportError as exc:
+        raise ImportError(
+            "TF-IDF dependencies are missing. Install training dependencies for tfidf backend."
+        ) from exc
     out_dir = out_dir.resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -224,9 +249,9 @@ def save_rag_index_embeddings(
     np.save(embeddings_path, embeddings)
 
     meta = {
-        "backend": "sbert",
+        "backend": "openai",
         "embedding_model": model,
-        "embedding_provider": "sentence-transformers",
+        "embedding_provider": "openai",
         "n_rows": int(embeddings.shape[0]),
         "n_features": int(embeddings.shape[1]),
         "index_text_column": "index_text",
@@ -295,20 +320,14 @@ def upsert_chroma_index(
     chroma_path: Path,
     collection_name: str,
     embedding_model: str,
-    embedding_provider: str = "sentence-transformers",
+    embedding_provider: str = "openai",
     batch_size: int = 200,
 ) -> dict[str, Any]:
     chroma_path = chroma_path.resolve()
     chroma_path.mkdir(parents=True, exist_ok=True)
     client = _build_chroma_client(chroma_path)
-    collection = client.get_or_create_collection(
-        name=collection_name,
-        metadata={
-            "hnsw:space": "cosine",
-            "embedding_provider": embedding_provider,
-            "embedding_model": embedding_model,
-        },
-    )
+    # Keep collection metadata minimal for compatibility with older Chroma server builds.
+    collection = client.get_or_create_collection(name=collection_name)
 
     ids, documents, metadatas = _build_chroma_records(manifest, embeddings)
     if not ids:
@@ -351,9 +370,9 @@ def build_rag_index_from_corpus(
     corpus: pd.DataFrame,
     out_dir: Path | None = None,
     *,
-    backend: str = "sbert",
+    backend: str = "openai",
     storage: str = "local",
-    embed_model: str = "sentence-transformers/all-MiniLM-L6-v2",
+    embed_model: str = "text-embedding-3-small",
     max_chunk_chars: int = 0,
     chunk_overlap: int = 50,
     concat_query: bool = False,
@@ -375,8 +394,8 @@ def build_rag_index_from_corpus(
     if backend == "tfidf":
         vectorizer, matrix = fit_tfidf_index(texts)
         return save_rag_index_tfidf(manifest, vectorizer, matrix, target_dir)
-    if backend == "sbert":
-        embeddings = embed_texts_sbert(texts, model=embed_model)
+    if backend in {"sbert", "openai"}:
+        embeddings = embed_texts_openai(texts, model=embed_model)
         if storage == "local":
             return save_rag_index_embeddings(manifest, embeddings, target_dir, model=embed_model)
         if storage == "chroma":
@@ -387,23 +406,23 @@ def build_rag_index_from_corpus(
                 chroma_path=cpath,
                 collection_name=chroma_collection,
                 embedding_model=embed_model,
-                embedding_provider="sentence-transformers",
+                embedding_provider="openai",
                 batch_size=chroma_batch_size,
             )
-            result["backend"] = "sbert-chroma"
-            result["embedding_provider"] = "sentence-transformers"
+            result["backend"] = "openai-chroma"
+            result["embedding_provider"] = "openai"
             result["embedding_model"] = embed_model
             return result
         raise ValueError("storage must be either 'local' or 'chroma'")
-    raise ValueError("backend must be either 'tfidf' or 'sbert'")
+    raise ValueError("backend must be either 'tfidf' or 'openai'")
 
 
 def parse_args() -> argparse.Namespace:
     root = PROJECT_ROOT
-    default_model = os.environ.get("EMBED_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
+    default_model = os.environ.get("EMBED_MODEL", "text-embedding-3-small")
     default_collection = os.environ.get("CHROMA_COLLECTION", "rag_tickets")
     parser = argparse.ArgumentParser(
-        description="Build RAG index from retrieval_corpus.csv (tfidf or sentence-transformer embeddings)."
+        description="Build RAG index from retrieval_corpus.csv (tfidf or OpenAI embeddings)."
     )
     parser.add_argument(
         "--input",
@@ -419,8 +438,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--backend",
-        choices=("tfidf", "sbert"),
-        default="sbert",
+        choices=("tfidf", "openai", "sbert"),
+        default="openai",
         help="Index backend to build.",
     )
     parser.add_argument(
@@ -433,7 +452,7 @@ def parse_args() -> argparse.Namespace:
         "--embed-model",
         type=str,
         default=default_model,
-        help="SentenceTransformer model when backend=sbert.",
+        help="OpenAI embedding model when backend=openai.",
     )
     parser.add_argument(
         "--max-chunk-chars",
@@ -495,8 +514,8 @@ def main() -> None:
     )
     print(f"Backend         : {args.backend}")
     print(f"Storage         : {args.storage}")
-    if args.backend == "sbert":
-        print("Embed provider  : sentence-transformers")
+    if args.backend in {"sbert", "openai"}:
+        print("Embed provider  : openai")
         print(f"Embed model     : {args.embed_model}")
     print(f"Indexed rows    : {paths['n_rows']:,}")
     print(f"Feature columns : {paths['n_features']:,}")

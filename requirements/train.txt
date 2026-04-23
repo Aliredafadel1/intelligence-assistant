@@ -1,0 +1,5 @@
+-r serve.txt
+scikit-learn
+xgboost
+scipy
+joblib

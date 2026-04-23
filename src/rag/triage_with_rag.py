@@ -170,7 +170,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--embed-model",
         type=str,
-        default="sentence-transformers/all-MiniLM-L6-v2",
+        default="text-embedding-3-small",
         help="Embedding model for Chroma query path.",
     )
     parser.add_argument(

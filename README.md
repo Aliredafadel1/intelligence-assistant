@@ -13,15 +13,33 @@ RAG + ML + LLM pipeline for customer support ticket triage (TWCS-based).
 - `data/processed/` - prepared datasets and vector index artifacts
 - `data/artifacts/` - trained ML model + evaluation report
 
+## Two Execution Modes
+
+### Training mode (local, no Docker)
+
+Use this mode to prepare data, build embeddings, and train ML artifacts.
+
+- Installs from `requirements/train.txt`
+- Runs on your host machine
+- Produces artifacts in `data/processed/` and `data/artifacts/`
+
+### Serving mode (Docker)
+
+Use this mode for fast API responses with prebuilt artifacts.
+
+- Installs from `requirements/serve.txt`
+- Runs `backend`, `frontend`, and `chroma` in Docker Compose
+- Optimized for RAG/API response path (not training)
+
 ## Requirements
 
 - Python `>=3.10`
 - `uv` installed
 
-Install dependencies:
+Install local training dependencies:
 
 ```bash
-uv sync
+pip install -r requirements/train.txt
 ```
 
 ## Environment Setup
@@ -38,11 +56,11 @@ Use one hosted LLM provider key in `.env`:
 - `OPENROUTER_API_KEY`, or
 - `OPENAI_API_KEY`
 
-## Run Commands
+## Training Mode Commands (Local)
 
 Always run from repo root with module mode (`-m`).
 
-### 1) Prepare Datasets (shared for RAG + ML)
+### 1) Prepare datasets
 
 ```bash
 uv run python -m src.prepare_datasets
@@ -55,10 +73,10 @@ Outputs include:
 - `data/processed/ml_val.csv`
 - `data/processed/ml_test.csv`
 
-### 2) Build RAG Index (Chroma + sentence-transformers embeddings)
+### 2) Build RAG index (Chroma + OpenAI embeddings)
 
 ```bash
-uv run python -m src.rag.index_rag --backend sbert --storage chroma --chroma-collection rag_tickets --embed-model sentence-transformers/all-MiniLM-L6-v2
+uv run python -m src.rag.index_rag --backend openai --storage chroma --chroma-collection rag_tickets --embed-model text-embedding-3-small
 ```
 
 ### 3) Query Retrieval Only
@@ -70,7 +88,7 @@ uv run python -m src.rag.retrieve_rag --query "internet down cannot login" --bac
 ### 4) Full RAG Triage (RAG answer + non-RAG answer)
 
 ```bash
-uv run python -m src.rag.triage_with_rag --ticket "internet down cannot login" --retrieval-backend chroma --chroma-collection rag_tickets --embed-model sentence-transformers/all-MiniLM-L6-v2 --k 5 --json
+uv run python -m src.rag.triage_with_rag --ticket "internet down cannot login" --retrieval-backend chroma --chroma-collection rag_tickets --embed-model text-embedding-3-small --k 5 --json
 ```
 
 ### 5) Train ML Priority Baseline
@@ -101,6 +119,33 @@ uv run python -m src.ML.predict_zero_shot --ticket "internet down cannot login n
 ```bash
 uv run python -m src.ML.predict_compare --ticket "internet down cannot login now" --json
 ```
+
+### 9) One-shot local training script (Windows PowerShell)
+
+```powershell
+.\scripts\run_training_local.ps1
+```
+
+## Serving Mode Commands (Docker)
+
+### 1) Bring up serving stack
+
+```powershell
+$env:DOCKER_DEFAULT_PLATFORM='linux/arm64'
+docker compose up -d --build
+docker compose ps
+```
+
+### 2) Or use the helper script
+
+```powershell
+.\scripts\run_serving_docker.ps1
+```
+
+### 3) API defaults for fast serving
+
+- `/rag/ask` defaults to `backend=chroma` (faster than local TF-IDF path).
+- ML endpoints remain available, but they require training dependencies/artifacts.
 
 ## Expected JSON Outputs
 

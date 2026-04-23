@@ -14,7 +14,6 @@ from .schemas import CompareRequest
 try:
     from ..LLM.llm_client import default_model as default_llm_model
     from ..LLM.llm_client import generate_text
-    from ..ML.predict_compare import run_ml_prediction, run_zero_shot_prediction
     from ..observability.run_logger import RunLogger, utc_now_iso
     from ..rag.triage_with_rag import (
         build_non_rag_prompt,
@@ -25,7 +24,6 @@ try:
     )
 except ImportError:
     from LLM.llm_client import default_model as default_llm_model
-    from ML.predict_compare import run_ml_prediction, run_zero_shot_prediction
     from observability.run_logger import RunLogger, utc_now_iso
     from rag.triage_with_rag import (
         build_non_rag_prompt,
@@ -34,6 +32,20 @@ except ImportError:
         run_retrieval,
         top_answer_tweet_id,
     )
+
+
+def _load_ml_predictors() -> tuple[Callable[..., Any], Callable[..., Any]]:
+    try:
+        from ..ML.predict_compare import run_ml_prediction, run_zero_shot_prediction
+    except ImportError:
+        try:
+            from ML.predict_compare import run_ml_prediction, run_zero_shot_prediction
+        except ImportError as exc:
+            raise RuntimeError(
+                "ML endpoints are unavailable in serve mode. "
+                "Install training dependencies or run local training mode."
+            ) from exc
+    return run_ml_prediction, run_zero_shot_prediction
 
 
 def _timed_call(name: str, fn: Callable[[], Any]) -> tuple[Any, dict[str, Any]]:
@@ -110,6 +122,7 @@ def _build_retrieval_args(req: CompareRequest, llm_model: str) -> argparse.Names
 
 
 def run_compare_pipeline(req: CompareRequest) -> dict[str, Any]:
+    run_ml_prediction, run_zero_shot_prediction = _load_ml_predictors()
     llm_model = req.llm_model or default_llm_model()
     started_at = utc_now_iso()
     run_logger = RunLogger(Path(req.log_file))
@@ -281,7 +294,7 @@ def run_rag_ask(
     index_dir: str | None = None,
     chroma_path: str | None = None,
     chroma_collection: str = "rag_tickets",
-    embed_model: str = "sentence-transformers/all-MiniLM-L6-v2",
+    embed_model: str = "text-embedding-3-small",
 ) -> dict[str, Any]:
     args = argparse.Namespace(
         ticket=question,
@@ -306,6 +319,7 @@ def run_rag_ask(
 
 
 def run_ml_predict(*, ticket: str, model_path: str, author_id: str = "unknown_customer", outbound: bool = False) -> dict[str, Any]:
+    run_ml_prediction, _ = _load_ml_predictors()
     return run_ml_prediction(
         ticket,
         model_path=Path(model_path),
