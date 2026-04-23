@@ -9,6 +9,8 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
+import pandas as pd
+
 from .schemas import CompareRequest
 from ..LLM.llm_client import default_model as default_llm_model
 from ..LLM.llm_client import generate_text
@@ -107,7 +109,14 @@ def _build_retrieval_args(req: CompareRequest, llm_model: str) -> argparse.Names
 
 
 def run_compare_pipeline(req: CompareRequest) -> dict[str, Any]:
-    run_ml_prediction, run_zero_shot_prediction = _load_ml_predictors()
+    run_ml_prediction: Callable[..., Any] | None = None
+    run_zero_shot_prediction: Callable[..., Any] | None = None
+    ml_bootstrap_error: str | None = None
+    try:
+        run_ml_prediction, run_zero_shot_prediction = _load_ml_predictors()
+    except Exception as exc:  # noqa: BLE001
+        # Keep RAG/non-RAG path available even when optional ML deps are missing.
+        ml_bootstrap_error = str(exc)
     llm_model = req.llm_model or default_llm_model()
     started_at = utc_now_iso()
     run_logger = RunLogger(Path(req.log_file))
@@ -124,8 +133,9 @@ def run_compare_pipeline(req: CompareRequest) -> dict[str, Any]:
         top_answer_id = top_answer_tweet_id(retrieved)
 
     rag_answer: str | None = None
-    if retrieved is not None:
-        rag_prompt = build_triage_prompt(req.ticket, retrieved)
+    rag_context = retrieved if retrieved is not None else pd.DataFrame()
+    if rag_context is not None:
+        rag_prompt = build_triage_prompt(req.ticket, rag_context)
         rag_raw, rag_meta = _timed_call(
             "rag_generation",
             lambda: generate_text(
@@ -138,13 +148,6 @@ def run_compare_pipeline(req: CompareRequest) -> dict[str, Any]:
         )
         if rag_meta["ok"] and rag_raw is not None:
             rag_answer = normalize_rag_answer(rag_raw)
-    else:
-        rag_meta = {
-            "ok": False,
-            "latency_ms": 0.0,
-            "error": "Skipped because retrieval failed.",
-            "stage": "rag_generation",
-        }
 
     non_rag_prompt = build_non_rag_prompt(req.ticket)
     non_rag_answer, non_rag_meta = _timed_call(
@@ -158,24 +161,40 @@ def run_compare_pipeline(req: CompareRequest) -> dict[str, Any]:
         ),
     )
 
-    ml_output, ml_meta = _timed_call(
-        "ml_prediction",
-        lambda: run_ml_prediction(
-            req.ticket,
-            model_path=Path(req.model_path),
-            author_id=req.author_id,
-            outbound=req.outbound,
-        ),
-    )
+    if run_ml_prediction is not None and run_zero_shot_prediction is not None:
+        ml_output, ml_meta = _timed_call(
+            "ml_prediction",
+            lambda: run_ml_prediction(
+                req.ticket,
+                model_path=Path(req.model_path),
+                author_id=req.author_id,
+                outbound=req.outbound,
+            ),
+        )
 
-    zero_shot_output, zero_shot_meta = _timed_call(
-        "zero_shot_prediction",
-        lambda: run_zero_shot_prediction(
-            req.ticket,
-            llm_model=llm_model,
-            allow_fallback=allow_fallback,
-        ),
-    )
+        zero_shot_output, zero_shot_meta = _timed_call(
+            "zero_shot_prediction",
+            lambda: run_zero_shot_prediction(
+                req.ticket,
+                llm_model=llm_model,
+                allow_fallback=allow_fallback,
+            ),
+        )
+    else:
+        ml_output = None
+        zero_shot_output = None
+        ml_meta = {
+            "ok": False,
+            "latency_ms": 0.0,
+            "error": ml_bootstrap_error or "ML dependencies are unavailable.",
+            "stage": "ml_prediction",
+        }
+        zero_shot_meta = {
+            "ok": False,
+            "latency_ms": 0.0,
+            "error": ml_bootstrap_error or "LLM zero-shot predictor is unavailable.",
+            "stage": "zero_shot_prediction",
+        }
 
     total_latency_ms = round(
         retrieval_meta["latency_ms"]

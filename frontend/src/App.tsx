@@ -49,11 +49,23 @@ type CompareApiResponse = {
   metrics?: {
     latency_ms?: { total?: number }
   }
+  status?: {
+    retrieval?: { ok?: boolean; error?: string | null }
+    rag_generation?: { ok?: boolean; error?: string | null }
+  }
+}
+
+type ParsedRagAnswer = {
+  priority?: string
+  confidence?: number
+  rationale?: string
+  next_action?: string
 }
 
 function App() {
   const apiBaseUrl = import.meta.env.VITE_API_BASE_URL || '/api'
   const [selectedStep, setSelectedStep] = useState<PipelineStep | null>(null)
+  const [activeNavItem, setActiveNavItem] = useState('Overview')
   const [developerMode, setDeveloperMode] = useState(false)
   const [ticketInput, setTicketInput] = useState('urgent payment failed and internet down')
   const [isLoading, setIsLoading] = useState(false)
@@ -86,18 +98,64 @@ function App() {
         throw new Error(`Request failed: ${res.status}`)
       }
       const data: CompareApiResponse = await res.json()
-      const ragText = data.outputs?.rag_answer ?? 'No RAG answer returned.'
+      const ragRaw = data.outputs?.rag_answer ?? ''
+      let ragParsed: ParsedRagAnswer | null = null
+      if (ragRaw) {
+        try {
+          ragParsed = JSON.parse(ragRaw) as ParsedRagAnswer
+        } catch {
+          ragParsed = null
+        }
+      }
+
+      const ragText = ragParsed
+        ? [
+            'RAG Triage Result',
+            `Priority: ${ragParsed.priority ?? 'N/A'}`,
+            `Confidence: ${typeof ragParsed.confidence === 'number' ? ragParsed.confidence.toFixed(2) : 'N/A'}`,
+            '',
+            'Explanation:',
+            ragParsed.rationale ?? 'No rationale provided.',
+            '',
+            'Immediate Next Action:',
+            ragParsed.next_action ?? 'No next action provided.',
+          ].join('\n')
+        : data.outputs?.rag_answer ?? 'No RAG answer returned.'
       const nonRagText = data.outputs?.non_rag_answer ?? 'No non-RAG answer returned.'
       const mlPriority = data.outputs?.ml_prediction?.predicted_priority ?? 'N/A'
       const llmPriority = data.outputs?.llm_zero_shot_prediction?.prediction?.priority ?? 'N/A'
       const conf = data.outputs?.llm_zero_shot_prediction?.prediction?.confidence ?? 0
       const totalLatency = data.metrics?.latency_ms?.total ?? 0
 
-      setChatMessages((prev) => [
-        ...prev,
-        { role: 'assistant', text: `RAG: ${ragText}` },
-        { role: 'assistant', text: `Non-RAG: ${nonRagText}` },
-      ])
+      const topEvidence = (data.outputs?.retrieved ?? [])
+        .slice(0, 3)
+        .map((r, idx) => {
+          const text = (r.document_text || r.query_text || 'No text available').replace(/\s+/g, ' ').trim()
+          const compact = text.length > 220 ? `${text.slice(0, 220)}...` : text
+          return `${idx + 1}) score=${Number(r.similarity_score ?? 0).toFixed(3)} | ${compact}`
+        })
+      const evidenceText =
+        topEvidence.length > 0
+          ? ['Evidence Used (Top Matches):', ...topEvidence].join('\n')
+          : 'Evidence Used (Top Matches): none returned'
+
+      const warningText =
+        data.status?.retrieval?.ok === false || data.status?.rag_generation?.ok === false
+          ? `Warning: retrieval/rag stage reported an issue. retrieval=${String(data.status?.retrieval?.error ?? 'unknown')} | rag=${String(data.status?.rag_generation?.error ?? 'unknown')}`
+          : null
+
+      setChatMessages((prev) => {
+        const next = [
+          ...prev,
+          { role: 'assistant' as const, text: ragText },
+          { role: 'assistant' as const, text: evidenceText },
+          { role: 'assistant' as const, text: `Non-RAG baseline:\n${nonRagText}` },
+        ]
+        if (warningText) {
+          next.push({ role: 'assistant', text: warningText })
+        }
+        return next
+      })
 
       const retrieved = (data.outputs?.retrieved ?? []).slice(0, 3).map((r, idx) => ({
         id: `live_${idx}`,
@@ -125,35 +183,68 @@ function App() {
     }
   }
 
+  const sectionIds: Record<string, string> = {
+    Overview: 'overview',
+    Pipeline: 'pipeline',
+    Retrieval: 'retrieval',
+    Models: 'models',
+    Analytics: 'analytics',
+    'Knowledge Base': 'knowledge-base',
+    Experiments: 'experiments',
+    Assistant: 'assistant',
+  }
+
+  const handleSidebarSelect = (label: string) => {
+    setActiveNavItem(label)
+    const sectionId = sectionIds[label]
+    if (!sectionId) {
+      return
+    }
+    const sectionEl = document.getElementById(sectionId)
+    sectionEl?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+  }
+
   return (
     <div className="flex min-h-screen">
-      <Sidebar />
+      <Sidebar activeItem={activeNavItem} onSelect={handleSidebarSelect} />
       <main className="flex-1 p-6">
-        <div className="mx-auto flex max-w-[1480px] flex-col gap-5">
-          <Header
-            developerMode={developerMode}
-            onToggleDeveloperMode={() => setDeveloperMode((prev) => !prev)}
-          />
-          <InputPanel
-            value={ticketInput}
-            isLoading={isLoading}
-            onChange={setTicketInput}
-            onRun={runInference}
-            onUseSample={() => setTicketInput('urgent payment failed and internet down')}
-          />
-          <PipelineFlow steps={pipelineSteps} onSelectStep={setSelectedStep} />
-          <section className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
+        <div id="overview" className="mx-auto flex max-w-[1480px] flex-col gap-5">
+          <section>
+            <Header
+              developerMode={developerMode}
+              onToggleDeveloperMode={() => setDeveloperMode((prev) => !prev)}
+            />
+            <InputPanel
+              value={ticketInput}
+              isLoading={isLoading}
+              onChange={setTicketInput}
+              onRun={runInference}
+              onUseSample={() => setTicketInput('urgent payment failed and internet down')}
+            />
+          </section>
+          <section id="pipeline">
+            <PipelineFlow steps={pipelineSteps} onSelectStep={setSelectedStep} />
+          </section>
+          <section id="models" className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
             {statItems.map((kpi) => (
               <StatCard key={kpi.title} {...kpi} />
             ))}
           </section>
-          <InsightsCharts latencyData={latencyData} confidenceData={confidenceData} />
-          <section className="grid gap-4 xl:grid-cols-[1.25fr_1fr]">
-            <RetrievalPanel chunks={chunks} />
-            <ChatAssistant messages={chatMessages} isLoading={isLoading} />
+          <section id="analytics">
+            <InsightsCharts latencyData={latencyData} confidenceData={confidenceData} />
           </section>
-          <RecentQueriesTable rows={recentQueries} />
-          <DeveloperModePanel enabled={developerMode} />
+          <section id="retrieval" className="grid gap-4 xl:grid-cols-[1.25fr_1fr]">
+            <RetrievalPanel chunks={chunks} />
+            <div id="assistant">
+              <ChatAssistant messages={chatMessages} isLoading={isLoading} />
+            </div>
+          </section>
+          <section id="knowledge-base">
+            <RecentQueriesTable rows={recentQueries} />
+          </section>
+          <section id="experiments">
+            <DeveloperModePanel enabled={developerMode} />
+          </section>
         </div>
       </main>
       <StepDetailsModal step={selectedStep} onClose={() => setSelectedStep(null)} />

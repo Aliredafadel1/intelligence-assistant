@@ -24,7 +24,7 @@ export function ChatAssistant({ messages, isLoading = false }: ChatAssistantProp
                 : 'ml-auto bg-indigo-600/30 text-indigo-100'
             }`}
           >
-            {msg.text}
+            <p className="whitespace-pre-wrap break-words">{msg.text}</p>
           </div>
         ))}
         {isLoading && (
