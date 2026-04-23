@@ -6,10 +6,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-try:
-    from ..preprocess_common import project_root
-except ImportError:
-    from preprocess_common import project_root
+from ..preprocess_common import project_root
 
 
 def utc_now_iso() -> str:

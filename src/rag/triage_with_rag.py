@@ -6,28 +6,16 @@ from pathlib import Path
 
 import pandas as pd
 
-try:
-    from ..LLM.llm_client import default_model as default_llm_model
-    from ..LLM.llm_client import generate_text
-    from .retrieve_rag import (
-        default_chroma_dir,
-        default_index_dir,
-        load_rag_index,
-        retrieve_top_k,
-        retrieve_top_k_chroma,
-        select_output_columns,
-    )
-except ImportError:
-    from LLM.llm_client import default_model as default_llm_model
-    from LLM.llm_client import generate_text
-    from retrieve_rag import (
-        default_chroma_dir,
-        default_index_dir,
-        load_rag_index,
-        retrieve_top_k,
-        retrieve_top_k_chroma,
-        select_output_columns,
-    )
+from ..LLM.llm_client import default_model as default_llm_model
+from ..LLM.llm_client import generate_text
+from .retrieve_rag import (
+    default_chroma_dir,
+    default_index_dir,
+    load_rag_index,
+    retrieve_top_k,
+    retrieve_top_k_chroma,
+    select_output_columns,
+)
 
 
 def build_context_block(results: pd.DataFrame, max_items: int = 5) -> str:
