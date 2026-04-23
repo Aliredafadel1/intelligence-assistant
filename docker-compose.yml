@@ -1,0 +1,42 @@
+services:
+  chroma:
+    image: chromadb/chroma:0.5.20
+    container_name: ai_chroma
+    ports:
+      - "8001:8000"
+    volumes:
+      - chroma_data:/chroma/chroma
+    restart: unless-stopped
+
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    container_name: ai_backend
+    env_file:
+      - .env
+    environment:
+      - CHROMA_HOST=chroma
+      - CHROMA_PORT=8000
+    ports:
+      - "8000:8000"
+    depends_on:
+      - chroma
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: ai_frontend
+    ports:
+      - "5173:80"
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+volumes:
+  chroma_data:

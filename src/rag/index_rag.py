@@ -56,6 +56,25 @@ def default_chroma_dir() -> Path:
     return default_processed_dir() / "chroma_db"
 
 
+def _build_chroma_client(chroma_path: Path) -> chromadb.ClientAPI:
+    host = (os.environ.get("CHROMA_HOST") or "").strip()
+    port_raw = (os.environ.get("CHROMA_PORT") or "").strip()
+    if host:
+        try:
+            port = int(port_raw) if port_raw else 8000
+        except ValueError:
+            port = 8000
+        return chromadb.HttpClient(
+            host=host,
+            port=port,
+            settings=Settings(anonymized_telemetry=False),
+        )
+    return chromadb.PersistentClient(
+        path=str(chroma_path.resolve()),
+        settings=Settings(anonymized_telemetry=False),
+    )
+
+
 def chunk_text(text: str, max_chars: int, overlap: int) -> list[str]:
     """
     Character-based chunking with overlap. If ``max_chars`` <= 0, returns ``[text]``.
@@ -281,10 +300,7 @@ def upsert_chroma_index(
 ) -> dict[str, Any]:
     chroma_path = chroma_path.resolve()
     chroma_path.mkdir(parents=True, exist_ok=True)
-    client = chromadb.PersistentClient(
-        path=str(chroma_path),
-        settings=Settings(anonymized_telemetry=False),
-    )
+    client = _build_chroma_client(chroma_path)
     collection = client.get_or_create_collection(
         name=collection_name,
         metadata={

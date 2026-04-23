@@ -79,6 +79,25 @@ def default_chroma_dir() -> Path:
     return default_index_dir().parent / "chroma_db"
 
 
+def _build_chroma_client(chroma_path: Path) -> chromadb.ClientAPI:
+    host = (os.environ.get("CHROMA_HOST") or "").strip()
+    port_raw = (os.environ.get("CHROMA_PORT") or "").strip()
+    if host:
+        try:
+            port = int(port_raw) if port_raw else 8000
+        except ValueError:
+            port = 8000
+        return chromadb.HttpClient(
+            host=host,
+            port=port,
+            settings=Settings(anonymized_telemetry=False),
+        )
+    return chromadb.PersistentClient(
+        path=str(chroma_path.resolve()),
+        settings=Settings(anonymized_telemetry=False),
+    )
+
+
 def load_rag_index(index_dir: Path) -> tuple[str, pd.DataFrame, dict[str, Any]]:
     root = index_dir.resolve()
     meta_path = root / "index_meta.json"
@@ -130,10 +149,7 @@ def retrieve_top_k_chroma(
     q = query.strip()
     if not q:
         raise ValueError("Query is empty.")
-    db = chromadb.PersistentClient(
-        path=str(chroma_path.resolve()),
-        settings=Settings(anonymized_telemetry=False),
-    )
+    db = _build_chroma_client(chroma_path)
     collection = db.get_collection(name=collection_name)
     metadata = collection.metadata or {}
     effective_model = model or metadata.get("embedding_model") or "sentence-transformers/all-MiniLM-L6-v2"

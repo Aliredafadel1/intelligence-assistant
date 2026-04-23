@@ -52,6 +52,7 @@ type CompareApiResponse = {
 }
 
 function App() {
+  const apiBaseUrl = import.meta.env.VITE_API_BASE_URL || '/api'
   const [selectedStep, setSelectedStep] = useState<PipelineStep | null>(null)
   const [developerMode, setDeveloperMode] = useState(false)
   const [ticketInput, setTicketInput] = useState('urgent payment failed and internet down')
@@ -67,7 +68,7 @@ function App() {
     setIsLoading(true)
     setChatMessages((prev) => [...prev, { role: 'user', text: ticketInput }])
     try {
-      const res = await fetch('http://127.0.0.1:8000/comparison/compare', {
+      const res = await fetch(`${apiBaseUrl}/comparison/compare`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
