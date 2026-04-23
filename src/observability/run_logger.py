@@ -6,15 +6,13 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from ..preprocess_common import project_root
-
-
 def utc_now_iso() -> str:
     return datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
 def build_default_log_path() -> Path:
-    return project_root() / "logs" / "runs.jsonl"
+    project_root = Path(__file__).resolve().parents[2]
+    return project_root / "logs" / "runs.jsonl"
 
 
 class RunLogger:
