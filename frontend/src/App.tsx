@@ -45,6 +45,18 @@ type CompareApiResponse = {
       document_text?: string
       query_text?: string
     }>
+    confidence?: {
+      rag?: number | null
+      non_rag?: number | null
+      ml?: number | null
+      llm_zero_shot?: number | null
+    }
+    rag_grounding?: {
+      top_similarity_score?: number | null
+      similarity_threshold?: number
+      is_low_similarity?: boolean
+      reason?: string
+    }
   }
   metrics?: {
     latency_ms?: { total?: number }
@@ -124,7 +136,7 @@ function App() {
       const nonRagText = data.outputs?.non_rag_answer ?? 'No non-RAG answer returned.'
       const mlPriority = data.outputs?.ml_prediction?.predicted_priority ?? 'N/A'
       const llmPriority = data.outputs?.llm_zero_shot_prediction?.prediction?.priority ?? 'N/A'
-      const conf = data.outputs?.llm_zero_shot_prediction?.prediction?.confidence ?? 0
+      const conf = data.outputs?.confidence?.llm_zero_shot ?? data.outputs?.llm_zero_shot_prediction?.prediction?.confidence ?? 0
       const totalLatency = data.metrics?.latency_ms?.total ?? 0
 
       const topEvidence = (data.outputs?.retrieved ?? [])
@@ -143,6 +155,10 @@ function App() {
         data.status?.retrieval?.ok === false || data.status?.rag_generation?.ok === false
           ? `Warning: retrieval/rag stage reported an issue. retrieval=${String(data.status?.retrieval?.error ?? 'unknown')} | rag=${String(data.status?.rag_generation?.error ?? 'unknown')}`
           : null
+      const lowSimilarityWarning =
+        data.outputs?.rag_grounding?.is_low_similarity === true
+          ? `Grounding warning: low retrieval similarity (${Number(data.outputs?.rag_grounding?.top_similarity_score ?? 0).toFixed(3)}) below threshold ${Number(data.outputs?.rag_grounding?.similarity_threshold ?? 0.35).toFixed(2)}.`
+          : null
 
       setChatMessages((prev) => {
         const next = [
@@ -153,6 +169,9 @@ function App() {
         ]
         if (warningText) {
           next.push({ role: 'assistant', text: warningText })
+        }
+        if (lowSimilarityWarning) {
+          next.push({ role: 'assistant', text: lowSimilarityWarning })
         }
         return next
       })

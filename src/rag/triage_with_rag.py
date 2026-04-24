@@ -57,8 +57,10 @@ def build_non_rag_prompt(ticket_text: str) -> str:
     return (
         "You are a customer support assistant.\n"
         "Generate a concise response to the customer ticket with no retrieved context.\n"
-        "Keep it practical and action-oriented in 2-4 sentences.\n\n"
-        f"Customer ticket:\n{ticket_text.strip()}"
+        "Keep it practical and action-oriented in 2-4 sentences.\n"
+        "Return ONLY compact JSON with keys: answer, confidence.\n"
+        "confidence must be a number between 0 and 1 and represent your answer confidence.\n\n"
+        f"Customer ticket:\n{ticket_text.strip()}\n"
     )
 
 
@@ -111,6 +113,19 @@ def normalize_rag_answer(raw_answer: str) -> str:
         "next_action": str(parsed.get("next_action", "")).strip() or "No next action provided.",
     }
     return json.dumps(normalized)
+
+
+def normalize_non_rag_answer(raw_answer: str) -> dict[str, object]:
+    parsed = _extract_json_object(raw_answer)
+    if parsed is None:
+        return {
+            "answer": (raw_answer or "").strip() or "No non-RAG answer returned.",
+            "confidence": 0.5,
+        }
+    return {
+        "answer": str(parsed.get("answer", "")).strip() or "No non-RAG answer returned.",
+        "confidence": _normalize_confidence(parsed.get("confidence")),
+    }
 
 
 def top_answer_tweet_id(results: pd.DataFrame) -> int | None:

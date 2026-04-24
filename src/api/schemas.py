@@ -18,6 +18,7 @@ class CompareRequest(BaseModel):
     outbound: bool = False
     llm_model: str | None = None
     allow_llm_fallback: bool = True
+    rag_similarity_threshold: float = Field(0.35, ge=0.0, le=1.0)
     log_file: str = "logs/runs.jsonl"
     no_log: bool = False
     log_top_k: int = Field(3, ge=0, le=20)

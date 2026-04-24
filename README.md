@@ -126,6 +126,19 @@ uv run python -m src.ML.predict_compare --ticket "internet down cannot login now
 .\scripts\run_training_local.ps1
 ```
 
+### 10) Compare text-only vs engineered ML features
+
+```bash
+uv run python -m src.ML.compare_feature_sets --output data/artifacts/feature_ablation_report.json
+```
+
+### 11) Visualize embeddings with PCA or t-SNE
+
+```bash
+uv run python -m src.ML.visualize_embeddings --method pca --output data/artifacts/embedding_projection_pca.png
+uv run python -m src.ML.visualize_embeddings --method tsne --output data/artifacts/embedding_projection_tsne.png
+```
+
 ## Serving Mode Commands (Docker)
 
 ### 1) Bring up serving stack
@@ -153,6 +166,8 @@ docker compose ps
   - `rag_answer`
   - `non_rag_answer`
   - `top_answer_tweet_id`
+  - `confidence` (rag, non_rag, ml, llm_zero_shot)
+  - `rag_grounding` (`top_similarity_score`, `similarity_threshold`, `is_low_similarity`, `reason`)
 - ML prediction:
   - `predicted_priority_label`
   - `predicted_priority`

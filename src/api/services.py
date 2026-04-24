@@ -18,6 +18,7 @@ from ..observability.run_logger import RunLogger, utc_now_iso
 from ..rag.triage_with_rag import (
     build_non_rag_prompt,
     build_triage_prompt,
+    normalize_non_rag_answer,
     normalize_rag_answer,
     run_retrieval,
     top_answer_tweet_id,
@@ -108,6 +109,33 @@ def _build_retrieval_args(req: CompareRequest, llm_model: str) -> argparse.Names
     )
 
 
+def _parse_json_dict(text: str | None) -> dict[str, Any] | None:
+    if not text:
+        return None
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _ml_confidence(ml_output: Any) -> float | None:
+    if not isinstance(ml_output, dict):
+        return None
+    probs = ml_output.get("probabilities")
+    if not isinstance(probs, dict) or not probs:
+        return None
+    values: list[float] = []
+    for score in probs.values():
+        try:
+            values.append(float(score))
+        except (TypeError, ValueError):
+            continue
+    if not values:
+        return None
+    return round(max(values), 2)
+
+
 def run_compare_pipeline(req: CompareRequest) -> dict[str, Any]:
     run_ml_prediction: Callable[..., Any] | None = None
     run_zero_shot_prediction: Callable[..., Any] | None = None
@@ -150,7 +178,7 @@ def run_compare_pipeline(req: CompareRequest) -> dict[str, Any]:
             rag_answer = normalize_rag_answer(rag_raw)
 
     non_rag_prompt = build_non_rag_prompt(req.ticket)
-    non_rag_answer, non_rag_meta = _timed_call(
+    non_rag_raw, non_rag_meta = _timed_call(
         "non_rag_generation",
         lambda: generate_text(
             non_rag_prompt,
@@ -160,6 +188,9 @@ def run_compare_pipeline(req: CompareRequest) -> dict[str, Any]:
             allow_fallback=allow_fallback,
         ),
     )
+    non_rag = normalize_non_rag_answer(non_rag_raw or "")
+    non_rag_answer = str(non_rag.get("answer", "No non-RAG answer returned."))
+    non_rag_confidence = non_rag.get("confidence")
 
     if run_ml_prediction is not None and run_zero_shot_prediction is not None:
         ml_output, ml_meta = _timed_call(
@@ -204,6 +235,22 @@ def run_compare_pipeline(req: CompareRequest) -> dict[str, Any]:
         + zero_shot_meta["latency_ms"],
         2,
     )
+    rag_parsed = _parse_json_dict(rag_answer)
+    rag_confidence = None if rag_parsed is None else rag_parsed.get("confidence")
+    zero_shot_confidence = None
+    if isinstance(zero_shot_output, dict):
+        pred = zero_shot_output.get("prediction")
+        if isinstance(pred, dict):
+            zero_shot_confidence = pred.get("confidence")
+    top_similarity = None
+    if retrieved_records:
+        first = retrieved_records[0]
+        if isinstance(first, dict):
+            try:
+                top_similarity = float(first.get("similarity_score"))
+            except (TypeError, ValueError):
+                top_similarity = None
+    low_similarity = top_similarity is None or top_similarity < req.rag_similarity_threshold
 
     payload = {
         "run_id": run_id,
@@ -223,6 +270,22 @@ def run_compare_pipeline(req: CompareRequest) -> dict[str, Any]:
             "llm_zero_shot_prediction": zero_shot_output,
             "retrieved": retrieved_records,
             "top_answer_tweet_id": top_answer_id,
+            "confidence": {
+                "rag": rag_confidence,
+                "non_rag": non_rag_confidence,
+                "ml": _ml_confidence(ml_output),
+                "llm_zero_shot": zero_shot_confidence,
+            },
+            "rag_grounding": {
+                "top_similarity_score": top_similarity,
+                "similarity_threshold": req.rag_similarity_threshold,
+                "is_low_similarity": low_similarity,
+                "reason": (
+                    "Top retrieval similarity is below threshold; RAG evidence may be weak."
+                    if low_similarity
+                    else "Top retrieval similarity is above threshold; grounding signal is acceptable."
+                ),
+            },
         },
         "metrics": {
             "latency_ms": {
